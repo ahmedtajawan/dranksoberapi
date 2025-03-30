@@ -4,5 +4,5 @@ numpy
 librosa
 joblib
 pydub
-scikit-learn==1.6.1
 python-multipart
+scikit-learn==1.5.1
