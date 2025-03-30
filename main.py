@@ -1,35 +1,52 @@
-import streamlit as st
-import sounddevice as sd
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+import librosa
 import numpy as np
+import joblib
+import os
 import io
-import wavio
+from pydub import AudioSegment
 
-st.title('🎙️ Streamlit In-Browser Audio Recorder')
+app = FastAPI()
 
-# Audio recording settings
-fs = 44100  # Sample rate
-seconds = st.slider('Select recording duration (seconds)', 1, 60, 5)  # Recording duration
+# Load Models
+model_drunk = joblib.load('model_drunk.pkl')
+le_drunk = joblib.load('label_encoder_drunk.pkl')
 
-# Initialize session state to store audio data
-if 'audio_buffer' not in st.session_state:
-    st.session_state['audio_buffer'] = None
+def extract_features(y, sr):
+    y, _ = librosa.effects.trim(y)
+    if len(y) < sr:
+        return None
 
-# Record button
-if st.button('Record'):
-    st.write('Recording...')
-    recording = sd.rec(int(seconds * fs), samplerate=fs, channels=2)
-    sd.wait()  # Wait until recording is finished
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    mfcc_mean = np.mean(mfcc, axis=1).tolist()
+    mfcc_std = np.std(mfcc, axis=1).tolist()
+    zcr = float(np.mean(librosa.feature.zero_crossing_rate(y)))
+    rms = float(np.mean(librosa.feature.rms(y=y)))
+    centroid = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
+    tempo = float(librosa.beat.beat_track(y=y, sr=sr)[0])
 
-    # Save recording to a buffer instead of a file
-    audio_buffer = io.BytesIO()
-    wavio.write(audio_buffer, recording, fs, sampwidth=2)
-    audio_buffer.seek(0)
+    features = mfcc_mean + mfcc_std + [zcr, rms, centroid, tempo]
+    return np.array(features).reshape(1, -1)
 
-    # Store in session state
-    st.session_state['audio_buffer'] = audio_buffer
 
-    st.write('Recording complete!')
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    audio_bytes = await file.read()
+    audio_buffer = io.BytesIO(audio_bytes)
+    
+    # Load audio with librosa
+    y, sr = librosa.load(audio_buffer, sr=None)
 
-# Playback the recording if available
-if st.session_state['audio_buffer'] is not None:
-    st.audio(st.session_state['audio_buffer'].getvalue(), format='audio/wav')
+    # Extract features
+    features = extract_features(y, sr)
+
+    if features is None:
+        return JSONResponse(content={"detail": "Audio too short for feature extraction."}, status_code=400)
+
+    drunk_probs = model_drunk.predict_proba(features)[0]
+    drunk_idx = np.argmax(drunk_probs)
+    drunk_label = le_drunk.inverse_transform([drunk_idx])[0]
+    drunk_conf = drunk_probs[drunk_idx] * 100
+
+    return JSONResponse({"condition": drunk_label, "confidence": drunk_conf})
